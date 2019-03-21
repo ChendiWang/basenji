@@ -19,7 +19,7 @@ setup(
     install_requires=[
         'h5py', 'joblib', 'matplotlib', 'networkx', 'numpy', 'pandas',
         'pillow', 'pyBigWig', 'pysam', 'scipy', 'seaborn',
-        'scikit-learn', 'statsmodels', 'tensorflow'
+        'scikit-learn', 'statsmodels', 'tensorflow-gpu'
     ])
 
 # fetch
