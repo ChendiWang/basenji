@@ -16,6 +16,7 @@
 
 from __future__ import print_function
 from optparse import OptionParser
+import pdb
 import os
 import random
 import sys
@@ -31,14 +32,15 @@ import pandas as pd
 import pyBigWig
 from scipy.stats import spearmanr, poisson
 import seaborn as sns
-from sklearn.metrics import roc_auc_score, roc_curve, precision_recall_curve, average_precision_score
+from sklearn.metrics import roc_auc_score, roc_curve
+from sklearn.metrics import precision_recall_curve, average_precision_score
 import tensorflow as tf
 
 from basenji import batcher
+from basenji import dataset
 from basenji import params
 from basenji import plots
 from basenji import seqnn
-from basenji import tfrecord_batcher
 
 """
 basenji_test.py
@@ -54,6 +56,8 @@ def main():
   parser = OptionParser(usage)
   parser.add_option('--ai', dest='accuracy_indexes',
       help='Comma-separated list of target indexes to make accuracy scatter plots.')
+  parser.add_option('-b', dest='track_bed',
+      help='BED file describing regions so we can output BigWig tracks')
   parser.add_option('--clip', dest='target_clip',
       default=None, type='float',
       help='Clip targets and predictions to a maximum value [Default: %default]')
@@ -81,8 +85,9 @@ def main():
   parser.add_option('--shifts', dest='shifts',
       default='0',
       help='Ensemble prediction shifts [Default: %default]')
-  parser.add_option('-t', dest='track_bed',
-      help='BED file describing regions so we can output BigWig tracks')
+  parser.add_option('-t', dest='targets_file',
+      default=None, type='str',
+      help='File specifying target indexes and labels in table format')
   parser.add_option('--ti', dest='track_indexes',
       help='Comma-separated list of target indexes to output BigWig tracks')
   parser.add_option('--tfr', dest='tfr_pattern',
@@ -107,15 +112,16 @@ def main():
   options.shifts = [int(shift) for shift in options.shifts.split(',')]
 
   # read targets
-  targets_file = '%s/targets.txt' % data_dir
-  targets_df = pd.read_table(targets_file, index_col=0)
+  if options.targets_file is None:
+    options.targets_file = '%s/targets.txt' % data_dir
+  targets_df = pd.read_table(options.targets_file, index_col=0)
 
   # read model parameters
   job = params.read_job_params(params_file)
 
   # construct data ops
   tfr_pattern_path = '%s/tfrecords/%s' % (data_dir, options.tfr_pattern)
-  data_ops, test_init_op = make_data_ops(job, tfr_pattern_path)
+  data_ops, test_init_op, test_dataseq = make_data_ops(job, tfr_pattern_path)
 
   # initialize model
   model = seqnn.SeqNN()
@@ -137,15 +143,19 @@ def main():
     # test
     t0 = time.time()
     sess.run(test_init_op)
-    test_acc = model.test_tfr(sess)
-    print('SeqNN test: %ds' % (time.time() - t0))
+    test_acc = model.test_tfr(sess, test_dataseq)
 
     test_preds = test_acc.preds
     test_targets = test_acc.targets
+    print('SeqNN test: %ds' % (time.time() - t0))
 
     if options.save:
-      np.save('%s/preds.npy' % options.out_dir, test_acc.preds)
-      np.save('%s/targets.npy' % options.out_dir, test_acc.targets)
+      preds_h5 = h5py.File('%s/preds.h5' % options.out_dir, 'w')
+      preds_h5.create_dataset('preds', data=test_preds)
+      preds_h5.close()
+      targets_h5 = h5py.File('%s/targets.h5' % options.out_dir, 'w')
+      targets_h5.create_dataset('targets', data=test_targets)
+      targets_h5.close()
 
     # compute stats
     t0 = time.time()
@@ -166,18 +176,20 @@ def main():
 
     acc_out = open('%s/acc.txt' % options.out_dir, 'w')
     for ti in range(len(test_r2)):
-      print(
-        '%4d  %7.5f  %.5f  %.5f  %.5f  %s' %
-        (ti, test_acc.target_losses[ti], test_r2[ti], test_pcor[ti],
-          test_log_pcor[ti], targets_df.description.iloc[ti]), file=acc_out)
+      print('%4d  %7.5f  %.5f  %.5f  %.5f  %10s  %s' %
+              (ti, test_acc.target_losses[ti], test_r2[ti], test_pcor[ti], test_log_pcor[ti],
+               targets_df.identifier.iloc[ti], targets_df.description.iloc[ti]),
+            file=acc_out)
     acc_out.close()
 
     # print normalization factors
     target_means = test_preds.mean(axis=(0,1), dtype='float64')
     target_means_median = np.median(target_means)
-    target_means /= target_means_median
+    # target_means /= target_means_median
     norm_out = open('%s/normalization.txt' % options.out_dir, 'w')
-    print('\n'.join([str(tu) for tu in target_means]), file=norm_out)
+    # print('\n'.join([str(tu) for tu in target_means]), file=norm_out)
+    for ti in range(len(target_means)):
+      print(ti, target_means[ti], target_means_median/target_means[ti], file=norm_out)
     norm_out.close()
 
     # clean up
@@ -231,6 +243,7 @@ def main():
     print('Test AUROC:     %7.5f' % np.mean(aurocs))
     print('Test AUPRC:     %7.5f' % np.mean(auprcs))
 
+
   #######################################################
   # BigWig tracks
 
@@ -248,10 +261,6 @@ def main():
     if options.track_indexes:
       track_indexes = [int(ti) for ti in options.track_indexes.split(',')]
 
-    bed_set = 'test'
-    if options.valid:
-      bed_set = 'valid'
-
     for ti in track_indexes:
       test_targets_ti = test_targets[:, :, ti]
 
@@ -262,7 +271,8 @@ def main():
           test_targets_ti,
           options.track_bed,
           options.genome_file,
-          bed_set=bed_set)
+          model.hp.batch_buffer)
+      # buffer unnecessary, but there are overlaps without it
 
       # make predictions bigwig
       bw_file = '%s/tracks/t%d_preds.bw' % (options.out_dir, ti)
@@ -271,17 +281,8 @@ def main():
           test_preds[:, :, ti],
           options.track_bed,
           options.genome_file,
-          model.hp.batch_buffer,
-          bed_set=bed_set)
+          model.hp.batch_buffer)
 
-    # make NA bigwig
-    # bw_file = '%s/tracks/na.bw' % options.out_dir
-    # bigwig_write(
-    #     bw_file,
-    #     test_na,
-    #     options.track_bed,
-    #     options.genome_file,
-    #     bed_set=bed_set)
 
   #######################################################
   # accuracy plots
@@ -309,9 +310,6 @@ def main():
 
       # sample every few bins (adjust to plot the # points I want)
       ds_indexes = np.arange(0, test_preds.shape[1], 8)
-      # ds_indexes_preds = np.arange(0, test_preds.shape[1], 8)
-      # ds_indexes_targets = ds_indexes_preds + (
-      #     model.hp.batch_buffer // model.hp.target_pool)
 
       # subset and flatten
       test_targets_ti_flat = test_targets_ti[:, ds_indexes].flatten(
@@ -445,7 +443,7 @@ def bigwig_write(bw_file,
                  track_bed,
                  genome_file,
                  buffer=0,
-                 bed_set='test'):
+                 bed_set=None):
   """ Write a signal track to a BigWig file over the regions
          specified by track_bed.
 
@@ -455,6 +453,7 @@ def bigwig_write(bw_file,
      track_bed:   BED file specifying sequence coordinates
      genome_file: Chromosome lengths file
      buffer:      Length skipped on each side of the region.
+     bed_set:     Filter BED file for train/valid/test
     """
 
   bw_out = bigwig_open(bw_file, genome_file)
@@ -465,7 +464,7 @@ def bigwig_write(bw_file,
   # set entries
   for line in open(track_bed):
     a = line.split()
-    if a[3] == bed_set:
+    if bed_set is None or a[3] == bed_set:
       chrom = a[0]
       start = int(a[1])
       end = int(a[2])
@@ -511,25 +510,19 @@ def bigwig_write(bw_file,
 
 def make_data_ops(job, tfr_pattern):
   def make_dataset(pat, mode):
-    return tfrecord_batcher.tfrecord_dataset(
-        pat,
-        job['batch_size'],
-        job['seq_length'],
-        job.get('seq_depth', 4),
-        job['target_length'],
-        job['num_targets'],
-        mode=mode,
-        repeat=False)
+    return dataset.DatasetSeq(
+      tfr_pattern,
+      job['batch_size'],
+      job['seq_length'],
+      job['target_length'],
+      mode=mode)
 
-  test_dataset = make_dataset(tfr_pattern, mode=tf.estimator.ModeKeys.EVAL)
+  test_dataseq = make_dataset(tfr_pattern, mode=tf.estimator.ModeKeys.EVAL)
+  test_dataseq.make_iterator_structure()
+  data_ops = test_dataseq.iterator.get_next()
+  test_init_op = test_dataseq.make_initializer()
 
-  iterator = tf.data.Iterator.from_structure(
-      test_dataset.output_types, test_dataset.output_shapes)
-  data_ops = iterator.get_next()
-
-  test_init_op = iterator.make_initializer(test_dataset)
-
-  return data_ops, test_init_op
+  return data_ops, test_init_op, test_dataseq
 
 
 ################################################################################

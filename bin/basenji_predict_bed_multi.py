@@ -29,9 +29,9 @@ import numpy as np
 import slurm
 
 """
-basenji_sat_bed_multi.py
+basenji_predict_bed_multi.py
 
-Perform an in silico saturation mutagenesis of sequences in a BED file,
+Predict sequences from a BED file,
 using multiple processes.
 """
 
@@ -42,21 +42,28 @@ def main():
   usage = 'usage: %prog [options] <params_file> <model_file> <bed_file>'
   parser = OptionParser(usage)
 
-  # basenji_sat_bed.py options
+  # basenji_predict_bed.py options
+  parser.add_option('-b', dest='bigwig_indexes',
+      default=None, help='Comma-separated list of target indexes to write BigWigs')
+  parser.add_option('-e', dest='embed_layer',
+      default=None, type='int', help='Embed sequences using the specified layer index.')
   parser.add_option('-f', dest='genome_fasta',
       default=None,
       help='Genome FASTA for sequences [Default: %default]')
-  parser.add_option('-l', dest='mut_len',
-      default=200, type='int',
-      help='Length of center sequence to mutate [Default: %default]')
+  parser.add_option('-g', dest='genome_file',
+      default=None,
+      help='Chromosome length information [Default: %default]')
+  parser.add_option('-l', dest='site_length',
+      default=None, type='int',
+      help='Prediction site length. [Default: params.seq_length]')
   parser.add_option('-o', dest='out_dir',
-      default='sat_mut', help='Output directory [Default: %default]')
-  parser.add_option('--plots', dest='plots',
-      default=False, action='store_true',
-      help='Make heatmap plots [Default: %default]')
+      default='pred_out', help='Output directory [Default: %default]')
   parser.add_option('--rc', dest='rc',
       default=False, action='store_true',
       help='Ensemble forward and reverse complement predictions [Default: %default]')
+  parser.add_option('-s', dest='sum',
+      default=False, action='store_true',
+      help='Sum site predictions [Default: %default]')
   parser.add_option('--shifts', dest='shifts',
       default='0',
       help='Ensemble prediction shifts [Default: %default]')
@@ -65,14 +72,11 @@ def main():
       help='File specifying target indexes and labels in table format')
 
   # _multi.py options
-  parser.add_option('-n', dest='name',
-      default='sat',
-      help='SLURM job name prefix [Default: %default]')
   parser.add_option('-p', dest='processes',
       default=None, type='int',
       help='Number of processes, passed by multi script')
   parser.add_option('-q', dest='queue',
-      default='k80',
+      default='gtx1080ti',
       help='SLURM queue on which to run the jobs [Default: %default]')
   parser.add_option('-r', dest='restart',
       default=False, action='store_true',
@@ -110,16 +114,15 @@ def main():
     if not options.restart or not job_completed(options, pi):
       cmd = '. /home/drk/anaconda3/etc/profile.d/conda.sh;'
       cmd += ' conda activate tf1.14-gpu;'
-
-      cmd += ' basenji_sat_bed.py %s %s %d' % (
+      cmd += ' basenji_predict_bed.py %s %s %d' % (
           options_pkl_file, ' '.join(args), pi)
-      name = '%s_p%d' % (options.name, pi)
+      name = 'pred_p%d' % pi
       outf = '%s/job%d.out' % (options.out_dir, pi)
       errf = '%s/job%d.err' % (options.out_dir, pi)
       j = slurm.Job(cmd, name,
           outf, errf,
           queue=options.queue, gpu=1,
-          mem=30000, time='14-0:0:0')
+          mem=45000, time='14-0:0:0')
       jobs.append(j)
 
   slurm.multi_run(jobs, max_proc=options.processes, verbose=True,
@@ -135,7 +138,7 @@ def main():
 
 
 def collect_h5(out_dir, num_procs):
-  h5_file = 'scores.h5'
+  h5_file = 'predict.h5'
 
   # count sequences
   num_seqs = 0
@@ -143,9 +146,8 @@ def collect_h5(out_dir, num_procs):
     # open job
     job_h5_file = '%s/job%d/%s' % (out_dir, pi, h5_file)
     job_h5_open = h5py.File(job_h5_file, 'r')
-    num_seqs += job_h5_open['scores'].shape[0]
-    seq_len = job_h5_open['scores'].shape[1]
-    num_targets = job_h5_open['scores'].shape[-1]
+    num_seqs += job_h5_open['preds'].shape[0]
+    num_targets = job_h5_open['preds'].shape[1]
     job_h5_open.close()
 
   # initialize final h5
@@ -195,8 +197,8 @@ def collect_h5(out_dir, num_procs):
 def job_completed(options, pi):
   """Check whether a specific job has generated its
      output file."""
-  out_file = '%s/job%d/scores.h5' % (options.out_dir, pi)
-  return os.path.isfile(out_file) or os.path.isdir(out_file)
+  job_h5_file = '%s/job%d/predict.h5' % (options.out_dir, pi)
+  return os.path.isfile(job_h5_file)
 
 
 ################################################################################

@@ -316,7 +316,6 @@ class ChrSAD5:
 
     def open_chr_sad5(self, **sad5_kw_args):
         self.chr_sad5 = {}
-
         for sad_h5_file in glob.glob('%s/*/sad.h5' % self.sad_h5_path):
             sad5 = SAD5(sad_h5_file, **sad5_kw_args)
             chrm = sad_h5_file.split('/')[-2]

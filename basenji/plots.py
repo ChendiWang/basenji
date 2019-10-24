@@ -18,7 +18,7 @@ from __future__ import print_function
 import sys
 
 import matplotlib
-matplotlib.use('PDF')
+matplotlib.use('agg')
 import matplotlib.pyplot as plt
 import seaborn as sns
 
@@ -41,7 +41,11 @@ def jointplot(vals1,
               figsize=(6, 6),
               sample=None,
               table=False,
-              kind='scatter'):
+              kind='scatter',
+              text_means=False,
+              tight=False,
+              outlier_low=None,
+              outlier_high=None):
 
   if table:
     out_txt = '%s.txt' % out_pdf[:-4]
@@ -71,7 +75,9 @@ def jointplot(vals1,
   else:
     cor_func = None
 
-  if kind == 'scatter':
+  if kind == 'hex':
+    joint_kws = {}
+  elif kind == 'scatter':
     joint_kws = {'alpha':alpha, 's':point_size}
   else:
     gold = sns.color_palette('husl',8)[1]
@@ -79,8 +85,22 @@ def jointplot(vals1,
     joint_kws['scatter_kws'] = {'color':'black', 's':point_size, 'alpha':alpha}
     joint_kws['line_kws'] = {'color':gold}
 
+  # compute summary stat pre-filter
+  u1 = np.mean(vals1)
+  u2 = np.mean(vals2)
+
+  # filter outliers for aesthetic purposes
+  if outlier_low is not None:
+    vals1 = vals1[vals1 > outlier_low]
+    vals2 = vals2[vals2 > outlier_low]
+  if outlier_high is not None:
+    vals1 = vals1[vals1 < outlier_high]
+    vals2 = vals2[vals2 < outlier_high]
+  assert(len(vals1) > 0)
+  assert(len(vals1) == len(vals2))
+
   g = sns.jointplot(vals1, vals2,
-        color='black', size=figsize,
+        color='black', height=figsize,
         space=0, stat_func=cor_func,
         kind=kind, joint_kws=joint_kws)
 
@@ -88,24 +108,36 @@ def jointplot(vals1,
 
   if square:
     vmin, vmax = scatter_lims(vals1, vals2)
-    ax.set_xlim(vmin, vmax)
-    ax.set_ylim(vmin, vmax)
-
+    xmin = vmin
+    ymin = vmin
+    xmax = vmax
+    ymax = vmax
     ax.plot([vmin, vmax], [vmin, vmax], linestyle='--', color='black')
-
   else:
     xmin, xmax = scatter_lims(vals1)
-    ax.set_xlim(xmin, xmax)
     ymin, ymax = scatter_lims(vals2)
-    ax.set_ylim(ymin, ymax)
+  ax.set_xlim(xmin, xmax)
+  ax.set_ylim(ymin, ymax)
 
   if y_label is not None:
     ax.set_ylabel(y_label)
   if x_label is not None:
     ax.set_xlabel(x_label)
 
+  if text_means:
+    eps = .05
+    text_xeps = eps*(xmax-xmin)
+    test_yeps = eps*(ymax-ymin)
+
+    # ax.text(xmax+text_xeps, ymin-test_yeps, 'mean %.3f'%u1, horizontalalignment='right', fontsize=14)
+    # ax.text(xmin-text_xeps, ymax+test_yeps, 'mean %.3f'%u2, horizontalalignment='left', fontsize=14)
+
+    ax.text(1-eps, eps, 'Mean %.3f'%u1, horizontalalignment='right', transform=ax.transAxes)
+    ax.text(eps, 1-eps, 'Mean %.3f'%u2, verticalalignment='top', transform=ax.transAxes)
+
   # ax.grid(True, linestyle=':')
-  # plt.tight_layout(w_pad=0, h_pad=0)
+  if tight:
+    plt.tight_layout(w_pad=0, h_pad=0)
 
   plt.savefig(out_pdf)
   plt.close()
@@ -117,15 +149,17 @@ def regplot(vals1,
             poly_order=1,
             alpha=0.5,
             point_size=10,
+            colors=None,
             cor='pearsonr',
             print_sig=False,
-            square=True,
+            square=False,
             x_label=None,
             y_label=None,
             title=None,
             figsize=(6, 6),
             sample=None,
-            table=False):
+            table=False,
+            tight=False):
 
   if table:
     out_txt = '%s.txt' % out_pdf[:-4]
@@ -142,15 +176,21 @@ def regplot(vals1,
   plt.figure(figsize=figsize)
 
   gold = sns.color_palette('husl', 8)[1]
-  ax = sns.regplot(
-      vals1,
-      vals2,
-      color='black',
-      order=poly_order,
-      scatter_kws={'color': 'black',
-                   's': point_size,
-                   'alpha': alpha},
-      line_kws={'color': gold})
+
+  if colors is None:
+    ax = sns.regplot(vals1, vals2, color='black',
+        order=poly_order,
+        scatter_kws={'color': 'black',
+                     's': point_size,
+                     'alpha': alpha},
+        line_kws={'color': gold})
+  else:
+    plt.scatter(vals1, vals2, c=colors,
+        s=point_size, alpha=alpha, cmap='RdBu')
+    plt.colorbar()
+    ax = sns.regplot(vals1, vals2,
+        scatter=False, order=poly_order,
+        line_kws={'color':gold})
 
   if square:
     xmin, xmax = scatter_lims(vals1, vals2)
@@ -192,7 +232,7 @@ def regplot(vals1,
 
     ax.text(
         xmin + xlim_eps,
-        ymax - 3 * ylim_eps,
+        ymax - 2 * ylim_eps,
         corr_str,
         horizontalalignment='left',
         fontsize=12)
@@ -200,7 +240,8 @@ def regplot(vals1,
   # ax.grid(True, linestyle=':')
   sns.despine()
 
-  # plt.tight_layout(w_pad=0, h_pad=0)
+  if tight:
+    plt.tight_layout()
 
   plt.savefig(out_pdf)
   plt.close()

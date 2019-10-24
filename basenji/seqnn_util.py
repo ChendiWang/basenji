@@ -7,6 +7,7 @@ from __future__ import division
 from __future__ import print_function
 
 import pdb
+import sys
 import numpy as np
 import tensorflow as tf
 
@@ -16,7 +17,7 @@ from basenji import accuracy
 
 class SeqNNModel(object):
 
-  def build_grads(self, layers=[0]):
+  def build_grads(self, layers=[0], center=False):
     ''' Build gradient ops for predictions summed across the sequence for
          each target with respect to some set of layers.
     In
@@ -26,8 +27,13 @@ class SeqNNModel(object):
     self.grad_layers = layers
     self.grad_ops = []
 
+    ci = self.preds_length // 2
+
     for ti in range(self.hp.num_targets):
-      grad_ti_op = tf.gradients(self.preds_train[:,:,ti], [self.layer_reprs[li] for li in self.grad_layers])
+      if center:
+        grad_ti_op = tf.gradients(self.preds_train[:,ci:ci+2,ti], [self.layer_reprs[li] for li in self.grad_layers])
+      else:
+        grad_ti_op = tf.gradients(self.preds_train[:,:,ti], [self.layer_reprs[li] for li in self.grad_layers])
       self.grad_ops.append(grad_ti_op)
 
 
@@ -577,7 +583,7 @@ class SeqNNModel(object):
     if embed_penultimate:
       num_targets = self.hp.cnn_params[-1].filters
     else:
-      num_targets = self.hp.num_targets
+      num_targets = self.hp.sum_targets
       if target_indexes is not None:
         num_targets = len(target_indexes)
 
@@ -681,7 +687,7 @@ class SeqNNModel(object):
     if embed_penultimate:
       num_targets = self.hp.cnn_params[-1].filters
     else:
-      num_targets = self.hp.num_targets
+      num_targets = self.hp.sum_targets
       if target_indexes is not None:
         num_targets = len(target_indexes)
 
@@ -843,13 +849,14 @@ class SeqNNModel(object):
     else:
       return preds
 
-  def predict_tfr(self, sess, test_batches=None,
+  def predict_tfr(self, sess, test_batches=None, sample=1.,
                   return_var=False, return_all=False):
     """ Compute preidctions on a TFRecord test set.
 
         Args:
           sess:          TensorFlow session
           test_batches:  Number of test batches to use.
+          sample:        Down sample positions uniformly.
           return_var:    Return variance estimates
           return_all:    Retyrn all predictions.
 
@@ -857,6 +864,13 @@ class SeqNNModel(object):
           preds: S (sequences) x L (unbuffered length) x T (targets) array
       """
     fd = self.set_mode('test')
+
+    # down sample
+    if sample != 1:
+      assert(0 < sample < 1)
+      sample_pos_len = int(sample*self.preds_length)
+      sample_pos = np.linspace(0, self.preds_length-1,
+                               sample_pos_len, dtype='int')
 
     # initialize prediction data structures
     preds = []
@@ -877,6 +891,12 @@ class SeqNNModel(object):
 
         else:
           preds_batch = sess.run(self.preds_eval, feed_dict=fd)
+
+        # down sample
+        if sample != 1:
+          preds_batch = preds_batch[:,sample_pos,:]
+          if return_var or return_all:
+            preds_ensemble_batch = preds_ensemble_batch[:,sample_pos,:,:]
 
         # accumulate predictions and targets
         preds.append(preds_batch.astype('float16'))
@@ -954,7 +974,7 @@ class SeqNNModel(object):
     if embed_penultimate:
       num_targets = self.hp.cnn_params[-1].filters
     else:
-      num_targets = self.hp.num_targets
+      num_targets = self.hp.sum_targets
       if target_indexes is not None:
         num_targets = len(target_indexes)
 
@@ -983,22 +1003,35 @@ class SeqNNModel(object):
     return tss_preds
 
 
-  def test_tfr(self, sess, test_batches=None):
+  def test_tfr(self, sess, dataset, handle_ph=None, test_batches=None, sample=1.0):
     """ Compute model accuracy on a test set, where data is loaded from a queue.
 
         Args:
-          sess:         TensorFlow session
-          test_batches: Number of test batches to use.
+          sess:           TensorFlow session
+          dataset:        Dataset
+          handle_ph:      Dataset handle placeholder
+          test_batches:   Number of test batches to use.
+          sample:         Sample sequence positions to save predictions/targets.
 
         Returns:
           acc:          Accuracy object
       """
     fd = self.set_mode('test')
 
+    if handle_ph is not None:
+      fd[handle_ph] = dataset.handle
+
     # initialize prediction and target arrays
-    preds = []
-    targets = []
-    targets_na = []
+    if test_batches is None:
+      num_seqs = dataset.num_seqs
+    else:
+      num_seqs = min(dataset.num_seqs, test_batches*self.hp.batch_size)
+
+    # need to wait for variable num_targets
+    sample_length = int(np.round(sample*self.preds_length))
+    preds = None
+    targets = None
+    targets_na = np.zeros((num_seqs, sample_length), dtype='bool')
 
     batch_losses = []
     batch_target_losses = []
@@ -1007,18 +1040,32 @@ class SeqNNModel(object):
     # sequence index
     data_available = True
     batch_num = 0
+    si = 0
     while data_available and (test_batches is None or batch_num < test_batches):
       try:
         # make predictions
-        run_ops = [self.targets_eval, self.preds_eval,
+        run_ops = [self.targets_eval, self.preds_eval_loss,
                    self.loss_eval, self.loss_eval_targets]
         run_returns = sess.run(run_ops, feed_dict=fd)
         targets_batch, preds_batch, loss_batch, target_losses_batch = run_returns
+        batch_size, _, num_targets = preds_batch.shape
+
+        # w/ target knowledge, create arrays
+        if preds is None:
+          preds = np.zeros((num_seqs, sample_length, num_targets), dtype='float16')
+          targets = np.zeros((num_seqs, sample_length, num_targets), dtype='float16')
 
         # accumulate predictions and targets
-        preds.append(preds_batch.astype('float16'))
-        targets.append(targets_batch.astype('float16'))
-        targets_na.append(np.zeros([preds_batch.shape[0], self.preds_length], dtype='bool'))
+        if sample_length < self.preds_length:
+          sampled_indexes = np.random.choice(np.arange(self.preds_length),
+                                             size=sample_length, replace=False)
+          sampled_indexes.sort()
+          preds[si:si+batch_size] = preds_batch[:,sampled_indexes,:]
+          targets[si:si+batch_size] = targets_batch[:,sampled_indexes,:]
+        else:
+          preds[si:si+batch_size] = preds_batch
+          targets[si:si+batch_size] = targets_batch
+          # targets_na is already zero
 
         # accumulate loss
         batch_losses.append(loss_batch)
@@ -1026,14 +1073,10 @@ class SeqNNModel(object):
         batch_sizes.append(preds_batch.shape[0])
 
         batch_num += 1
+        si += batch_size
 
       except tf.errors.OutOfRangeError:
         data_available = False
-
-    # construct arrays
-    targets = np.concatenate(targets, axis=0)
-    preds = np.concatenate(preds, axis=0)
-    targets_na = np.concatenate(targets_na, axis=0)
 
     # mean across batches
     batch_losses = np.array(batch_losses, dtype='float64')
@@ -1046,6 +1089,7 @@ class SeqNNModel(object):
                             batch_losses, batch_target_losses)
 
     return acc
+
 
   def test_h5(self, sess, batcher, test_batches=None):
     """ Compute model accuracy on a test set.
@@ -1081,7 +1125,7 @@ class SeqNNModel(object):
       fd[self.targets_ph] = Yb
 
       # make predictions
-      run_ops = [self.targets_eval, self.preds_eval,
+      run_ops = [self.targets_eval, self.preds_eval_loss,
                  self.loss_eval, self.loss_eval_targets]
       run_returns = sess.run(run_ops, feed_dict=fd)
       targets_batch, preds_batch, loss_batch, target_losses_batch = run_returns

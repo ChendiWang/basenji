@@ -35,6 +35,7 @@ from sklearn.metrics import roc_auc_score, roc_curve, precision_recall_curve, av
 import tensorflow as tf
 
 from basenji import batcher
+from basenji import dataset
 from basenji import params
 from basenji import plots
 from basenji import seqnn
@@ -209,7 +210,6 @@ def main():
   # model parameters and placeholders
 
   job = params.read_job_params(params_file)
-
   job['seq_length'] = test_seqs.shape[1]
   job['seq_depth'] = test_seqs.shape[2]
   job['num_targets'] = test_targets.shape[2]
@@ -693,7 +693,6 @@ def compute_full_accuracy(dr, model, test_preds, test_targets_full, out_dir,
   for ti in range(len(test_r2_full)):
     print('%4d  %.4f' % (ti, test_r2_full[ti]), file=acc_out)
   acc_out.close()
-
 
 ################################################################################
 # __main__

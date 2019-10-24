@@ -59,12 +59,6 @@ def main():
   parser.add_option('-f', dest='genome_fasta',
       default='%s/data/hg19.fa' % os.environ['BASENJIDIR'],
       help='Genome FASTA for sequences [Default: %default]')
-  parser.add_option('-g', dest='genome_file',
-      default='%s/data/human.hg19.genome' % os.environ['BASENJIDIR'],
-      help='Chromosome lengths file [Default: %default]')
-  parser.add_option('--h5', dest='out_h5',
-      default=False, action='store_true',
-      help='Output stats to sad.h5 [Default: %default]')
   parser.add_option('--local', dest='local',
       default=1024, type='int',
       help='Local SAD score [Default: %default]')
@@ -95,6 +89,9 @@ def main():
   parser.add_option('--ti', dest='track_indexes',
       default=None, type='str',
       help='Comma-separated list of target indexes to output BigWig tracks')
+  parser.add_option('--txt', dest='out_txt',
+    default=False, action='store_true',
+    help='Output stats to text table [Default: %default]')
   parser.add_option('-u', dest='penultimate',
       default=False, action='store_true',
       help='Compute SED in the penultimate layer [Default: %default]')
@@ -153,7 +150,7 @@ def main():
     target_subset = None
 
   else:
-    targets_df = pd.read_table(options.targets_file, index_col=0)
+    targets_df = pd.read_csv(options.targets_file, sep='\t', index_col=0)
     target_ids = targets_df.identifier
     target_labels = targets_df.description
     target_subset = targets_df.index
@@ -164,14 +161,18 @@ def main():
   #################################################################
   # load SNPs
 
-  snps = bvcf.vcf_snps(vcf_file)
-
   # filter for worker SNPs
   if options.processes is not None:
-    worker_bounds = np.linspace(0, len(snps), options.processes+1, dtype='int')
-    snps = snps[worker_bounds[worker_index]:worker_bounds[worker_index+1]]
+    # determine boundaries
+    num_snps = bvcf.vcf_count(vcf_file)
+    worker_bounds = np.linspace(0, num_snps, options.processes+1, dtype='int')
 
-  num_snps = len(snps)
+    # read SNPs form VCF
+    snps = bvcf.vcf_snps(vcf_file, start_i=worker_bounds[worker_index], end_i=worker_bounds[worker_index+1])
+
+  else:
+    # read SNPs form VCF
+    snps = bvcf.vcf_snps(vcf_file)
 
   # open genome FASTA
   genome_open = pysam.Fastafile(options.genome_fasta)
@@ -188,9 +189,9 @@ def main():
   snp_shapes = {'sequence': tf.TensorShape([tf.Dimension(job['seq_length']),
                                             tf.Dimension(4)])}
 
-  dataset = tf.data.Dataset().from_generator(snp_gen,
-                                             output_types=snp_types,
-                                             output_shapes=snp_shapes)
+  dataset = tf.data.Dataset.from_generator(snp_gen,
+                                           output_types=snp_types,
+                                           output_shapes=snp_shapes)
   dataset = dataset.batch(job['batch_size'])
   dataset = dataset.prefetch(2*job['batch_size'])
   if not options.cpu:
@@ -229,15 +230,11 @@ def main():
   #################################################################
   # setup output
 
-  if options.out_h5:
-    sad_out = initialize_output_h5(options.out_dir, options.sad_stats,
-                                   snps, target_ids, target_labels)
-
-  elif options.out_zarr:
+  if options.out_zarr:
     sad_out = initialize_output_zarr(options.out_dir, options.sad_stats,
                                      snps, target_ids, target_labels)
 
-  else:
+  elif options.out_txt:
     header_cols = ('rsid', 'ref', 'alt',
                   'ref_pred', 'alt_pred', 'sad', 'sar', 'geo_sad',
                   'ref_lpred', 'alt_lpred', 'lsad', 'lsar',
@@ -251,6 +248,10 @@ def main():
       sad_out = open('%s/sad_table.txt' % options.out_dir, 'w')
       print(' '.join(header_cols), file=sad_out)
 
+  else:
+    sad_out = initialize_output_h5(options.out_dir, options.sad_stats,
+                                   snps, target_ids, target_labels)
+
 
   #################################################################
   # process
@@ -262,10 +263,6 @@ def main():
   # initialize saver
   saver = tf.train.Saver()
   with tf.Session() as sess:
-    # coordinator
-    coord = tf.train.Coordinator()
-    tf.train.start_queue_runners(coord=coord)
-
     # load variables into session
     saver.restore(sess, model_file)
 
@@ -294,12 +291,13 @@ def main():
       # predict next
       batch_preds = model.predict_tfr(sess, test_batches=sw_batch_size)
 
+  print('Waiting for threads to finish.', flush=True)
   sum_write_thread.join()
 
   ###################################################
   # compute SAD distributions across variants
 
-  if options.out_h5 or options.out_zarr:
+  if not options.out_txt:
     # define percentiles
     d_fine = 0.001
     d_coarse = 0.01
@@ -386,8 +384,17 @@ def initialize_output_h5(out_dir, sad_stats, snps, target_ids, target_labels):
   snp_pos = np.array([snp.pos for snp in snps], dtype='uint32')
   sad_out.create_dataset('pos', data=snp_pos)
 
+  # check flips
+  snp_flips = [snp.flipped for snp in snps]
+
   # write SNP reference allele
-  snp_refs = np.array([snp.ref_allele for snp in snps], 'S')
+  snp_refs = []
+  for snp in snps:
+    if snp.flipped:
+      snp_refs.append(snp.alt_alleles[0])
+    else:
+      snp_refs.append(snp.ref_allele)
+  snp_refs = np.array(snp_refs, 'S')
   sad_out.create_dataset('ref', data=snp_refs)
 
   # write targets

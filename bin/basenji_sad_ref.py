@@ -16,6 +16,7 @@
 from __future__ import print_function
 
 from optparse import OptionParser
+import gc
 import pdb
 import pickle
 import os
@@ -35,6 +36,8 @@ import basenji.params as params
 import basenji.seqnn as seqnn
 import basenji.vcf as bvcf
 from basenji.stream import PredStream
+
+from basenji_sad import initialize_output_h5
 
 '''
 basenji_sad_ref.py
@@ -56,12 +59,9 @@ def main():
   parser.add_option('-f', dest='genome_fasta',
       default='%s/data/hg19.fa' % os.environ['BASENJIDIR'],
       help='Genome FASTA for sequences [Default: %default]')
-  parser.add_option('-g', dest='genome_file',
-      default='%s/data/human.hg19.genome' % os.environ['BASENJIDIR'],
-      help='Chromosome lengths file [Default: %default]')
-  parser.add_option('--h5', dest='out_h5',
+  parser.add_option('--flip', dest='flip_ref',
       default=False, action='store_true',
-      help='Output stats to sad.h5 [Default: %default]')
+      help='Flip reference/alternate alleles when simple [Default: %default]')
   parser.add_option('--local', dest='local',
       default=1024, type='int',
       help='Local SAD score [Default: %default]')
@@ -95,9 +95,6 @@ def main():
   parser.add_option('-u', dest='penultimate',
       default=False, action='store_true',
       help='Compute SED in the penultimate layer [Default: %default]')
-  # parser.add_option('-z', dest='out_zarr',
-  #     default=False, action='store_true',
-  #     help='Output stats to sad.zarr [Default: %default]')
   (options, args) = parser.parse_args()
 
   if len(args) == 3:
@@ -150,7 +147,7 @@ def main():
     target_subset = None
 
   else:
-    targets_df = pd.read_table(options.targets_file, index_col=0)
+    targets_df = pd.read_csv(options.targets_file, sep='\t', index_col=0)
     target_ids = targets_df.identifier
     target_labels = targets_df.description
     target_subset = targets_df.index
@@ -161,16 +158,21 @@ def main():
   #################################################################
   # load SNPs
 
-  # read sorted SNPs from VCF
-  snps = bvcf.vcf_snps(vcf_file, require_sorted=True, flip_ref=True,
-                       validate_ref_fasta=options.genome_fasta)
-
   # filter for worker SNPs
   if options.processes is not None:
-    worker_bounds = np.linspace(0, len(snps), options.processes+1, dtype='int')
-    snps = snps[worker_bounds[worker_index]:worker_bounds[worker_index+1]]
+    # determine boundaries
+    num_snps = bvcf.vcf_count(vcf_file)
+    worker_bounds = np.linspace(0, num_snps, options.processes+1, dtype='int')
 
-  num_snps = len(snps)
+    # read sorted SNPs from VCF
+    snps = bvcf.vcf_snps(vcf_file, require_sorted=True, flip_ref=options.flip_ref,
+                         validate_ref_fasta=options.genome_fasta,
+                         start_i=worker_bounds[worker_index],
+                         end_i=worker_bounds[worker_index+1])
+  else:
+    # read sorted SNPs from VCF
+    snps = bvcf.vcf_snps(vcf_file, require_sorted=True, flip_ref=options.flip_ref,
+                         validate_ref_fasta=options.genome_fasta)
 
   # cluster SNPs by position
   snp_clusters = cluster_snps(snps, job['seq_length'], options.center_pct)
@@ -192,16 +194,15 @@ def main():
   snp_shapes = {'sequence': tf.TensorShape([tf.Dimension(job['seq_length']),
                                             tf.Dimension(4)])}
 
-  dataset = tf.data.Dataset().from_generator(snp_gen,
-                                             output_types=snp_types,
-                                             output_shapes=snp_shapes)
+  dataset = tf.data.Dataset.from_generator(snp_gen,
+                                          output_types=snp_types,
+                                          output_shapes=snp_shapes)
   dataset = dataset.batch(job['batch_size'])
   dataset = dataset.prefetch(2*job['batch_size'])
   # dataset = dataset.apply(tf.contrib.data.prefetch_to_device('/device:GPU:0'))
 
   iterator = dataset.make_one_shot_iterator()
   data_ops = iterator.get_next()
-
 
   #################################################################
   # setup model
@@ -232,6 +233,8 @@ def main():
   #################################################################
   # setup output
 
+  snp_flips = np.array([snp.flipped for snp in snps], dtype='bool')
+
   sad_out = initialize_output_h5(options.out_dir, options.sad_stats,
                                  snps, target_ids, target_labels)
 
@@ -249,10 +252,6 @@ def main():
   # initialize saver
   saver = tf.train.Saver()
   with tf.Session() as sess:
-    # coordinator
-    coord = tf.train.Coordinator()
-    tf.train.start_queue_runners(coord=coord)
-
     # load variables into session
     saver.restore(sess, model_file)
 
@@ -276,7 +275,10 @@ def main():
         pi += 1
 
         # queue SNP
-        snp_queue.put((ref_preds, alt_preds, si))
+        if snp_flips[si]:
+          snp_queue.put((alt_preds, ref_preds, si))
+        else:
+          snp_queue.put((ref_preds, alt_preds, si))
 
         # update SNP index
         si += 1
@@ -335,44 +337,6 @@ def cluster_snps(snps, seq_len, center_pct):
       cluster_pos0 = snp.pos
 
   return snp_clusters
-
-
-def initialize_output_h5(out_dir, sad_stats, snps, target_ids, target_labels):
-  """Initialize an output HDF5 file for SAD stats."""
-
-  num_targets = len(target_ids)
-  num_snps = len(snps)
-
-  sad_out = h5py.File('%s/sad.h5' % out_dir, 'w')
-
-  # write SNPs
-  snp_ids = np.array([snp.rsid for snp in snps], 'S')
-  sad_out.create_dataset('snp', data=snp_ids)
-
-  # write SNP chr
-  snp_chr = np.array([snp.chr for snp in snps], 'S')
-  sad_out.create_dataset('chr', data=snp_chr)
-
-  # write SNP pos
-  snp_pos = np.array([snp.pos for snp in snps], dtype='uint32')
-  sad_out.create_dataset('pos', data=snp_pos)
-
-  # write SNP reference allele
-  snp_refs = np.array([snp.ref_allele for snp in snps], 'S')
-  sad_out.create_dataset('ref', data=snp_refs)
-
-  # write targets
-  sad_out.create_dataset('target_ids', data=np.array(target_ids, 'S'))
-  sad_out.create_dataset('target_labels', data=np.array(target_labels, 'S'))
-
-  # initialize SAD stats
-  for sad_stat in sad_stats:
-    sad_out.create_dataset(sad_stat,
-        shape=(num_snps, num_targets),
-        dtype='float16',
-        compression=None)
-
-  return sad_out
 
 
 class SNPCluster:
@@ -468,6 +432,9 @@ class SNPWorker(Thread):
                     - np.log2(ref_preds.astype('float64') + self.log_pseudo)
         geo_sad = sar_vec.sum(axis=0)
         self.sad_out['geoSAD'][szi,:] = geo_sad.astype('float16')
+
+      if szi % 32 == 0:
+        gc.collect()
 
       # communicate finished task
       self.queue.task_done()

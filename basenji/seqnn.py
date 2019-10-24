@@ -74,6 +74,7 @@ class SeqNN(seqnn_util.SeqNNModel):
                           ensemble_rc=False, ensemble_shifts=[0],
                           embed_penultimate=False, target_subset=None):
     """Build training ops from input data ops."""
+
     if not self.hparams_set:
       self.hp = params.make_hparams(job)
       self.hparams_set = True
@@ -90,14 +91,15 @@ class SeqNN(seqnn_util.SeqNNModel):
 
     # compute train representation
     self.preds_train = self.build_predict(data_ops_train['sequence'],
-                                          None, embed_penultimate, target_subset,
-                                          save_reprs=True)
+                                          None, embed_penultimate, None,
+                                          target_subset, save_reprs=True)
     self.target_length = self.preds_train.shape[1].value
 
     # training losses
     if not embed_penultimate:
-      loss_returns = self.build_loss(self.preds_train, data_ops_train['label'], target_subset)
-      self.loss_train, self.loss_train_targets, self.targets_train = loss_returns
+      loss_returns = self.build_loss(self.preds_train, data_ops_train['label'],
+                                     data_ops.get('genome',None), target_subset)
+      self.loss_train, self.loss_train_targets, self.targets_train = loss_returns[:3]
 
       # optimizer
       self.update_ops = tf.get_collection(tf.GraphKeys.UPDATE_OPS)
@@ -119,25 +121,30 @@ class SeqNN(seqnn_util.SeqNNModel):
 
     # compute eval representation
     map_elems_eval = (data_seq_eval, data_rev_eval)
-    build_rep = lambda do: self.build_predict(do[0], do[1], embed_penultimate, target_subset)
+    build_rep = lambda do: self.build_predict(do[0], do[1], embed_penultimate, None, target_subset)
     self.preds_ensemble = tf.map_fn(build_rep, map_elems_eval, dtype=tf.float32, back_prop=False)
     self.preds_eval = tf.reduce_mean(self.preds_ensemble, axis=0)
 
-    # eval loss
+    # eval loss and metrics
     if not embed_penultimate:
-      loss_returns = self.build_loss(self.preds_eval, data_ops['label'], target_subset)
-      self.loss_eval, self.loss_eval_targets, self.targets_eval = loss_returns
+      loss_returns = self.build_loss(self.preds_eval, data_ops['label'],
+                                     data_ops.get('genome', None), target_subset)
+      self.loss_eval, self.loss_eval_targets, self.targets_eval, self.preds_eval_loss = loss_returns
 
     # update # targets
     if target_subset is not None:
       self.hp.num_targets = len(target_subset)
+      self.hp.sum_targets = len(target_subset)
 
     # helper variables
-    self.preds_length = self.preds_train.shape[1]
+    self.preds_length = self.preds_train.shape[1].value
+    # self.batch_size_op = tf.shape(self.preds_eval)[0]
+
 
   def build_sad(self, job, data_ops,
                 ensemble_rc=False, ensemble_shifts=[0],
-                embed_penultimate=False, target_subset=None):
+                embed_penultimate=False, embed_layer=None,
+                target_subset=None):
     """Build SAD predict ops."""
     if not self.hparams_set:
       self.hp = params.make_hparams(job)
@@ -154,7 +161,7 @@ class SeqNN(seqnn_util.SeqNNModel):
 
     # compute eval representation
     map_elems_eval = (data_seq_eval, data_rev_eval)
-    build_rep = lambda do: self.build_predict(do[0], do[1], embed_penultimate, target_subset)
+    build_rep = lambda do: self.build_predict(do[0], do[1], embed_penultimate, embed_layer, target_subset)
     self.preds_ensemble = tf.map_fn(build_rep, map_elems_eval, dtype=tf.float32, back_prop=False)
     self.preds_eval = tf.reduce_mean(self.preds_ensemble, axis=0)
 
@@ -163,11 +170,13 @@ class SeqNN(seqnn_util.SeqNNModel):
       self.hp.num_targets = len(target_subset)
 
     # helper variables
-    self.preds_length = self.preds_eval.shape[1]
+    self.preds_length = self.preds_eval.shape[1].value
+    self.preds_depth = self.preds_eval.shape[-1].value
 
   def make_placeholders(self):
     """Allocates placeholders to be used in place of input data ops."""
-    # batches
+    self.genome_ph = tf.placeholder(tf.int32, shape=(None, 1), name='genome')
+
     self.inputs_ph = tf.placeholder(
         tf.float32,
         shape=(None, self.hp.seq_length, self.hp.seq_depth),
@@ -177,13 +186,13 @@ class SeqNN(seqnn_util.SeqNNModel):
       self.targets_ph = tf.placeholder(
           tf.float32,
           shape=(None, self.hp.seq_length // self.hp.target_pool,
-                 self.hp.num_targets),
+                 self.hp.sum_targets),
           name='targets')
     else:
       self.targets_ph = tf.placeholder(
           tf.int32,
           shape=(None, self.hp.seq_length // self.hp.target_pool,
-                 self.hp.num_targets),
+                 self.hp.sum_targets),
           name='targets')
 
     self.targets_na_ph = tf.placeholder(tf.bool,
@@ -191,10 +200,12 @@ class SeqNN(seqnn_util.SeqNNModel):
         name='targets_na')
 
     data = {
+        'genome': self.genome_ph,
         'sequence': self.inputs_ph,
         'label': self.targets_ph,
         'na': self.targets_na_ph
     }
+
     return data
 
   def _make_conv_block_args(self, layer_index, layer_reprs):
@@ -212,7 +223,7 @@ class SeqNN(seqnn_util.SeqNNModel):
         'name': 'conv-%d' % layer_index
     }
 
-  def build_predict(self, inputs, reverse_preds=None, embed_penultimate=False, target_subset=None, save_reprs=False):
+  def build_predict(self, inputs, reverse_preds=None, embed_penultimate=False, embed_layer=None, target_subset=None, save_reprs=False):
     """Construct per-location real-valued predictions."""
     assert inputs is not None
     print('Targets pooled by %d to length %d' %
@@ -261,23 +272,10 @@ class SeqNN(seqnn_util.SeqNNModel):
       print('Unrecognized nonlinearity "%s"' % self.hp.nonlinearity, file=sys.stderr)
       exit(1)
 
-    ###################################################
     # slice out side buffer
-    ###################################################
-
-    # update batch buffer to reflect pooling
-    seq_length = seqs_repr.shape[1].value
-    pool_preds = self.hp.seq_length // seq_length
-    assert self.hp.batch_buffer % pool_preds == 0, (
-        'batch_buffer %d not divisible'
-        ' by the CNN pooling %d') % (self.hp.batch_buffer, pool_preds)
-    batch_buffer_pool = self.hp.batch_buffer // pool_preds
-
-    # slice out buffer
+    seqs_repr = self.center_slice(seqs_repr)
     seq_length = seqs_repr.shape[1]
-    seqs_repr = seqs_repr[:, batch_buffer_pool:
-                          seq_length - batch_buffer_pool, :]
-    seq_length = seqs_repr.shape[1]
+
 
     ###################################################
     # final layer
@@ -286,15 +284,15 @@ class SeqNN(seqnn_util.SeqNNModel):
       final_repr = seqs_repr
     else:
       with tf.variable_scope('final', reuse=tf.AUTO_REUSE):
-        final_filters = self.hp.num_targets * self.hp.target_classes
+        final_filters = self.hp.sum_targets * self.hp.target_classes
         final_repr = tf.layers.dense(
             inputs=seqs_repr,
             units=final_filters,
             activation=None,
             kernel_initializer=tf.variance_scaling_initializer(scale=2.0, mode='fan_in'),
             kernel_regularizer=tf.contrib.layers.l1_regularizer(self.hp.final_l1_scale))
-        print('Convolution w/ %d %dx1 filters to final targets' %
-            (final_filters, seqs_repr.shape[2]))
+        print('Convolution w/ %d %dx1 filters to final targets' % \
+              (final_filters, seqs_repr.shape[2]))
 
         if target_subset is not None:
           # get convolution parameters
@@ -309,10 +307,13 @@ class SeqNN(seqnn_util.SeqNNModel):
           final_repr = tf.tensordot(seqs_repr, filters_subset, 1)
           final_repr = tf.nn.bias_add(final_repr, bias_subset)
 
+          # update # targets
+          sum_targets = len(target_subset)
+
         # expand length back out
         if self.hp.target_classes > 1:
           final_repr = tf.reshape(final_repr,
-                                  (-1, seq_length, self.hp.num_targets,
+                                  (-1, seq_length, sum_targets,
                                    self.hp.target_classes))
 
     # transform for reverse complement
@@ -324,8 +325,16 @@ class SeqNN(seqnn_util.SeqNNModel):
     ###################################################
     # link function
     ###################################################
-    if embed_penultimate:
+    if embed_layer is not None:
+      predictions = layer_reprs[embed_layer]
+      predictions = self.center_slice(predictions)
+      predictions = tf.cond(reverse_preds,
+                            lambda: tf.reverse(predictions, axis=[1]),
+                            lambda: predictions)
+
+    elif embed_penultimate:
       predictions = final_repr
+
     else:
       # work-around for specifying my own predictions
       # self.preds_adhoc = tf.placeholder(
@@ -369,6 +378,7 @@ class SeqNN(seqnn_util.SeqNNModel):
         predictions = tf.sqrt(predictions)
 
     return predictions
+
 
   def build_optimizer(self, loss_op):
     """Construct optimization op that minimizes loss_op."""
@@ -423,16 +433,48 @@ class SeqNN(seqnn_util.SeqNNModel):
     self.merged_summary = tf.summary.merge_all()
 
 
-  def build_loss(self, preds, targets, target_subset=None):
+  def build_loss(self, preds, targets, genome=None, target_subset=None):
     """Convert per-location real-valued predictions to a loss."""
 
-    # slice buffer
+    ##################################################
+    # slice positions
+
     tstart = self.hp.batch_buffer // self.hp.target_pool
     tend = (self.hp.seq_length - self.hp.batch_buffer) // self.hp.target_pool
     targets = tf.identity(targets[:, tstart:tend, :], name='targets_op')
 
+    ##################################################
+    # slice targets
+
     if target_subset is not None:
+      # manually specify targets
       targets = tf.gather(targets, target_subset, axis=2)
+
+    else:
+      # take genome index from first example of batch
+      try:
+        genome_i = genome[0,0]
+      except ValueError:
+        genome_i = tf.constant(0)
+
+      # find genome target start and end
+      genome_starts = []
+      genome_ends = []
+      gti = 0
+      for gi in range(self.hp.num_genomes):
+        genome_starts.append(gti)
+        gti += self.hp.num_targets[gi]
+        genome_ends.append(gti)
+      genome_starts = tf.constant(genome_starts)
+      genome_ends = tf.constant(genome_ends)
+
+      targets_start = tf.gather(genome_starts, genome_i)
+      targets_end = tf.gather(genome_ends, genome_i)
+
+      # slice to genome targets
+      target_indexes_genome = tf.range(targets_start, targets_end)
+      preds = tf.gather(preds, target_indexes_genome, axis=2)
+      targets = tf.gather(targets, target_indexes_genome, axis=2)
 
     # clip
     if self.hp.target_clip is not None:
@@ -441,6 +483,9 @@ class SeqNN(seqnn_util.SeqNNModel):
     # sqrt
     if self.hp.target_sqrt:
       targets = tf.sqrt(targets)
+
+    ##################################################
+    # loss
 
     loss_op = None
 
@@ -466,8 +511,8 @@ class SeqNN(seqnn_util.SeqNNModel):
 
     if target_subset is None:
       tf.summary.histogram('target_loss', loss_op)
-      for ti in np.linspace(0, self.hp.num_targets - 1, 10).astype('int'):
-        tf.summary.scalar('loss_t%d' % ti, loss_op[ti])
+      # for ti in np.linspace(0, self.hp.sum_targets - 1, 10).astype('int'):
+      #   tf.summary.scalar('loss_t%d' % ti, loss_op[ti])
 
     # fully reduce
     loss_op = tf.reduce_mean(loss_op, name='loss')
@@ -481,7 +526,7 @@ class SeqNN(seqnn_util.SeqNNModel):
     # track
     tf.summary.scalar('loss', loss_op)
 
-    return loss_op, target_losses, targets
+    return loss_op, target_losses, targets, preds
 
 
   def set_mode(self, mode):
@@ -505,6 +550,7 @@ class SeqNN(seqnn_util.SeqNNModel):
       exit(1)
 
     return fd
+
 
   def train_epoch_h5_manual(self,
                   sess,
@@ -657,3 +703,95 @@ class SeqNN(seqnn_util.SeqNNModel):
     avg_loss = np.average(train_loss, weights=batch_sizes)
 
     return avg_loss, global_step
+
+  def train2_epoch_ops(self, sess, handle_ph, datasets, sum_writer=None, epoch_batches=None):
+    """ Execute one training epoch for multiple iterators."""
+
+    assert(self.hp.num_genomes == len(datasets))
+    global_step = 0
+
+    # initialize training loss and batch size lists
+    train_losses = []
+    batch_sizes = []
+    for gi in range(self.hp.num_genomes):
+      train_losses.append([])
+      batch_sizes.append([])
+
+    # setup feed dict
+    fd = self.set_mode('train')
+
+    # reset genome sequence counters
+    for gi in range(self.hp.num_genomes):
+      datasets[gi].epoch_reset()
+
+    # sample first genome
+    batch_num = 0
+    gi = sample_genome(datasets)
+
+    while gi is not None and (epoch_batches is None or batch_num < epoch_batches):
+      try:
+        fd[handle_ph] = datasets[gi].handle
+        run_ops = [self.merged_summary, self.loss_train, self.preds_train, self.global_step, self.step_op] + self.update_ops
+        run_returns = sess.run(run_ops, feed_dict=fd)
+        summary, loss_batch, preds, global_step = run_returns[:4]
+
+        # add summary
+        if sum_writer is not None:
+          sum_writer.add_summary(summary, global_step)
+
+        # accumulate loss
+        train_losses[gi].append(loss_batch)
+        batch_sizes[gi].append(preds.shape[0])
+
+        # next batch
+        batch_num += 1
+
+      except tf.errors.OutOfRangeError:
+        print('Genome %d OutOfRangeError with %d sequences remaining.' % (gi, datasets[gi].epoch_seqs), file=sys.stderr)
+
+      # decrement genome seqs
+      datasets[gi].epoch_batch(self.hp.batch_size)
+
+      # sample next genome
+      gi = sample_genome(datasets)
+
+    # mean across batches
+    for gi in range(self.hp.num_genomes):
+      if train_losses[gi]:
+        train_losses[gi] = np.average(train_losses[gi], weights=batch_sizes[gi])
+      else:
+        train_losses[gi] = np.nan
+
+    return train_losses, global_step
+
+  def center_slice(self, seqs_repr):
+    """ Slice center region of the sequence, as determined by
+        the original sequence legnth and batch buffer. """
+
+    # determine buffer region for this sequence length
+    seq_length = seqs_repr.shape[1].value
+    pool_preds = self.hp.seq_length // seq_length
+    assert self.hp.batch_buffer % pool_preds == 0, (
+      'batch_buffer %d not divisible'
+      ' by the CNN pooling %d') % (self.hp.batch_buffer, pool_preds)
+    batch_buffer_pool = self.hp.batch_buffer // pool_preds
+
+    # slice out buffer
+    seq_length = seqs_repr.shape[1]
+    seqs_repr = seqs_repr[:, batch_buffer_pool:
+                          seq_length - batch_buffer_pool, :]
+
+    return seqs_repr
+
+
+def sample_genome(datasets):
+  """Sample a random genome, proportional to the number of remaining sequences."""
+  num_genomes = len(datasets)
+  genome_seqs = np.array([ds.epoch_seqs for ds in datasets], dtype='float32')
+  seqs_sum = genome_seqs.sum()
+  if seqs_sum == 0:
+    gi = None
+  else:
+    genome_probs = genome_seqs / seqs_sum
+    gi = np.random.choice(range(num_genomes), p=genome_probs)
+  return gi
